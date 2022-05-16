@@ -4,7 +4,6 @@ import os, sys
 import random
 import datetime
 import time
-from tkinter import scrolledtext
 from typing import List
 import json
 import numpy as np
@@ -32,7 +31,7 @@ from lib.utils.logger import setup_logger
 import lib.models
 from lib.models.aslloss import AsymmetricLossOptimized
 from lib.models.query2label import build_q2l, build_LRFormer
-from lib.utils.metric import voc_mAP, overall, overall_topk
+from lib.utils.metric import voc_mAP
 from lib.utils.misc import clean_state_dict
 from lib.utils.slconfig import get_raw_dict
 
@@ -187,7 +186,7 @@ def main():
         args.world_size = args.world_size * local_world_size
         args.rank = args.rank * local_world_size + args.local_rank
         print('world size: {}, world rank: {}, local rank: {}'.format(args.world_size, args.rank, args.local_rank))
-        # print('os.environ:', os.environ)
+        print('os.environ:', os.environ)
     else:
         # single process, useful for debugging
         #   python main.py ...
@@ -230,17 +229,14 @@ def main_worker(args, logger):
     # build model
     # model = build_q2l(args)
     model = build_LRFormer(args)
-
-    # args.lr_mult = args.batch_size / 256
-    # param_dicts = model.get_config_optim(lr=args.lr_mult * args.lr, lrp=0.1)
-
     model = model.cuda()
+    mask = None
     # input = torch.rand(1, 3, 448, 448)
     # params_num, flops = profile(model, inputs=(input,))
     # params_num, flops = clever_format([params_num, flops], '%.3f')
     # logger.info('complexity  ==>  params: {}M, FLOPs: {}G '.format(params_num, flops))
     ema_m = ModelEma(model, args.ema_decay) # 0.9997
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], broadcast_buffers=False, find_unused_parameters=True)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], broadcast_buffers=False)
 
     # criterion
     criterion = AsymmetricLossOptimized(
@@ -250,16 +246,12 @@ def main_worker(args, logger):
         eps=args.eps,
     )
 
-    # criterion = nn.MultiLabelSoftMarginLoss()
-    # criterion = nn.BCEWithLogitsLoss()
     # optimizer
-    
+    args.lr_mult = args.batch_size / 256
     if args.optim == 'AdamW':
         param_dicts = [
             {"params": [p for n, p in model.module.named_parameters() if p.requires_grad]},
         ]
-        args.lr_mult = args.batch_size / 256
-        # param_dicts = model.get_config_optim(lr=args.lr_mult * args.lr, lrp=0.1)
         optimizer = getattr(torch.optim, args.optim)(
             param_dicts,
             args.lr_mult * args.lr,
@@ -352,6 +344,7 @@ def main_worker(args, logger):
     best_ema_mAP = 0
     regular_mAP_list = []
     ema_mAP_list = []
+    mask = None
     torch.cuda.empty_cache()
     for epoch in range(args.start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
@@ -361,7 +354,7 @@ def main_worker(args, logger):
         torch.cuda.empty_cache()
 
         # train for one epoch
-        loss = train(train_loader, model, ema_m, criterion, optimizer, scheduler, epoch, args, logger)
+        loss, mask = train(train_loader, model, ema_m, mask, criterion, optimizer, scheduler, epoch, args, logger)
 
         if summary_writer:
             # tensorboard logger
@@ -372,8 +365,8 @@ def main_worker(args, logger):
         if epoch % args.val_interval == 0:
 
             # evaluate on validation set
-            loss, mAP = validate(val_loader, model, criterion, args, logger)
-            loss_ema, mAP_ema = validate(val_loader, ema_m.module, criterion, args, logger)
+            loss, mAP = validate(val_loader, model, mask, criterion, args, logger)
+            loss_ema, mAP_ema = validate(val_loader, ema_m.module, mask, criterion, args, logger)
             losses.update(loss)
             mAPs.update(mAP)
             losses_ema.update(loss_ema)
@@ -420,6 +413,7 @@ def main_worker(args, logger):
                     'state_dict': state_dict,
                     'best_mAP': best_mAP,
                     'optimizer' : optimizer.state_dict(),
+                    'mask' : mask,
                 }, is_best=is_best, filename=os.path.join(args.output, 'checkpoint.pth.tar'))
             # filename=os.path.join(args.output, 'checkpoint_{:04d}.pth.tar'.format(epoch))
 
@@ -436,7 +430,7 @@ def main_worker(args, logger):
 
             # early stop
             if args.early_stop:
-                if best_epoch >= 0 and epoch - max(best_epoch, best_regular_epoch) > 3:
+                if best_epoch >= 0 and epoch - max(best_epoch, best_regular_epoch) > 8:
                     if len(ema_mAP_list) > 1 and ema_mAP_list[-1] < best_ema_mAP:
                         logger.info("epoch - best_epoch = {}, stop!".format(epoch - best_epoch))
                         if dist.get_rank() == 0 and args.kill_stop:
@@ -452,9 +446,17 @@ def main_worker(args, logger):
     
     return 0
 
+def update_mask(res, mask, decay=0.9999):
+    new_mask = decay * res + (1. - decay) * mask if res is not None else mask
+    return new_mask
 
+def mask_trans(mask):
+    zero = torch.zeros_like(mask)
+    one = torch.ones_like(mask)
+    mask_one_hot = torch.where(mask>0.5, one, zero)
+    return mask_one_hot
 
-def train(train_loader, model, ema_m, criterion, optimizer, scheduler, epoch, args, logger):
+def train(train_loader, model, ema_m, mask, criterion, optimizer, scheduler, epoch, args, logger):
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
     
     batch_time = AverageMeter('T', ':5.3f')
@@ -478,36 +480,26 @@ def train(train_loader, model, ema_m, criterion, optimizer, scheduler, epoch, ar
 
     # switch to train mode
     model.train()
-
+    # mask = mask.cuda() if mask is not None else None
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
-        # bs = target.size(0)
-        # mask = torch.zeros([bs, 80, 80])
-        # for b in range(bs):
-        #     pos_ind = torch.nonzero(target[b]==1).squeeze(1)
-            # neg_ind = torch.nonzero(target[b]==1).squeeze(1)
-            # mask[b].index_fill_(0, pos_ind, 1)
-            # mask[b].index_fill_(1, pos_ind, 1)
-            # mask[b].index_fill_(0, neg_ind, 0)
-            # mask[b].index_fill_(1, neg_ind, 0)
 
         images = images.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
-        # mask = mask.cuda(non_blocking=True)
-        # mask = None
+
         # compute output
         with torch.cuda.amp.autocast(enabled=args.amp):
-            output = model(images)
-            # score1, score2 = model(images)
-            # cls_score = (score1 + score2) / 2.
-            # loss1 = criterion(score1, target)
-            # loss2 = criterion(score2, target)
+            mask_one_hot = mask_trans(mask).cuda() if mask is not None else None
+            b = images.shape[0]
+            mask_one_hot = mask_one_hot[0:b] if mask is not None else None
+            output, mask_temp = model(images, mask_one_hot)
+            mask_temp = mask_temp.detach().cpu()
+            mask = update_mask(mask, mask_temp)
+            del mask_temp
+            del mask_one_hot
             loss = criterion(output, target)
-            # loss = loss / images.size(0)
-            # loss = loss / target.size(1) * 1000
-
             if args.loss_dev > 0:
                 loss *= args.loss_dev
 
@@ -539,17 +531,17 @@ def train(train_loader, model, ema_m, criterion, optimizer, scheduler, epoch, ar
 
         if i % args.print_freq == 0:
             progress.display(i, logger)
-
-    return losses.avg
+    mask = mask.detach().cpu()
+    return losses.avg, mask
 
 
 
 @torch.no_grad()
-def validate(val_loader, model, criterion, args, logger):
+def validate(val_loader, model, mask, criterion, args, logger):
     batch_time = AverageMeter('Time', ':5.3f')
     losses = AverageMeter('Loss', ':5.3f')
-    # losses1 = AverageMeter('Loss1', ':5.3f')
-    # losses2 = AverageMeter('Loss2', ':5.3f')
+    lossC = AverageMeter('LossC', ':5.3f')
+    lossA = AverageMeter('LossA', ':5.3f')
     # Acc1 = AverageMeter('Acc@1', ':5.2f')
     # top5 = AverageMeter('Acc@5', ':5.2f')
     mem = AverageMeter('Mem', ':.0f', val_only=True)
@@ -562,8 +554,8 @@ def validate(val_loader, model, criterion, args, logger):
 
     # switch to evaluate mode
     saveflag = False
-    preds = None
-    targets = None
+    mask_one_hot = mask_trans(mask).cuda()
+    print(mask_one_hot)
     model.eval()
     saved_data = []
     with torch.no_grad():
@@ -571,20 +563,14 @@ def validate(val_loader, model, criterion, args, logger):
         for i, (images, target) in enumerate(val_loader):
             images = images.cuda(non_blocking=True)
             target = target.cuda(non_blocking=True)
-
+            
             # compute output
             with torch.cuda.amp.autocast(enabled=args.amp):
-                output = model(images)
-                # score1, score2 = model(images)
-                # output = score2
+                b = images.shape[0]
+                mask_one_hot = mask_one_hot[0:b]
+                output, _ = model(images, mask_one_hot)
                 # cls_score = (score1 + score2) / 2.
-                # loss1 = criterion(score1, target)
-                # loss2 = criterion(score2, target)
-                # loss = loss1 + loss2
                 loss = criterion(output, target)
-                # loss = loss / images.size(0)
-                # loss = loss / target.size(1) * 1000
-
                 if args.loss_dev > 0:
                     loss *= args.loss_dev
                 output_sm = torch.sigmoid(output)
@@ -592,11 +578,10 @@ def validate(val_loader, model, criterion, args, logger):
                     saveflag = True
 
             # record loss
+            # losses.update(loss.item(), images.size(0))
+            # print(lossC.item().shape, lossF.item().shape)
             losses.update(loss.item(), images.size(0))
             mem.update(torch.cuda.max_memory_allocated() / 1024.0 / 1024.0)
-            
-            preds = output.detach().cpu() if preds==None else torch.cat([output.detach().cpu(), preds], dim=0)
-            targets = target.detach().cpu() if targets==None else torch.cat([target.detach().cpu(), targets], dim=0)
 
             # save some data
             # output_sm = nn.functional.sigmoid(output)
@@ -612,6 +597,7 @@ def validate(val_loader, model, criterion, args, logger):
             if i % args.print_freq == 0 and dist.get_rank() == 0:
                 progress.display(i, logger)
 
+        mask = mask.detach().cpu()
         logger.info('=> synchronize...')
         if dist.get_world_size() > 1:
             dist.barrier()
@@ -620,7 +606,6 @@ def validate(val_loader, model, criterion, args, logger):
             [losses]
         )
         
-        # import ipdb; ipdb.set_trace()
         # calculate mAP
         saved_data = torch.cat(saved_data, 0).numpy()
         saved_name = 'saved_data_tmp.{}.txt'.format(dist.get_rank())
@@ -632,15 +617,10 @@ def validate(val_loader, model, criterion, args, logger):
             print("Calculating mAP:")
             filenamelist = ['saved_data_tmp.{}.txt'.format(ii) for ii in range(dist.get_world_size())]
             metric_func = voc_mAP                
-            mAP, aps, = metric_func([os.path.join(args.output, _filename) for _filename in filenamelist], args.num_class, return_each=True)
-            OP, OR, OF1, CP, CR, CF1, = overall(preds, targets)
-            OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k = overall_topk(preds, targets, 3)
+            mAP, aps = metric_func([os.path.join(args.output, _filename) for _filename in filenamelist], args.num_class, return_each=True)
+            
             logger.info("  mAP: {}".format(mAP))
             logger.info("   aps: {}".format(np.array2string(aps, precision=5)))
-            logger.info('CP: {CP:.3f},  CR: {CR:.3f},  CF1: {CF1:.3f},  OP: {OP:.3f},  OR: {OR:.3f},  OF1: {OF1:.3f}'.format(
-                    OP=OP, OR=OR, OF1=OF1, CP=CP, CR=CR, CF1=CF1))
-            logger.info('CP_3: {CP:.3f},  CR_3: {CR:.3f},  CF1_3: {CF1:.3f},  OP_3: {OP:.3f},  OR_3: {OR:.3f},  OF1_3: {OF1:.3f}'.format(
-                    OP=OP_k, OR=OR_k, OF1=OF1_k, CP=CP_k, CR=CR_k, CF1=CF1_k))
         else:
             mAP = 0
 

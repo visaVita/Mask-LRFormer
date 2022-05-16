@@ -4,7 +4,6 @@ import os, sys
 import random
 import datetime
 import time
-from tkinter import scrolledtext
 from typing import List
 import json
 import numpy as np
@@ -13,7 +12,6 @@ from thop import profile, clever_format
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.nn.parallel
 from torch.optim import lr_scheduler
 import torch.backends.cudnn as cudnn
@@ -31,18 +29,17 @@ from lib.dataset.get_dataset import get_datasets
 from lib.utils.logger import setup_logger
 import lib.models
 from lib.models.aslloss import AsymmetricLossOptimized
-from lib.models.query2label import build_q2l, build_LRFormer
-from lib.utils.metric import voc_mAP, overall, overall_topk
+from lib.models.query2label import build_q2l, build_LRFormer, build_LRFormer3D
+from lib.utils.metric import voc_mAP
 from lib.utils.misc import clean_state_dict
 from lib.utils.slconfig import get_raw_dict
 
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
 def parser_args():
     parser = argparse.ArgumentParser(description='Query2Label MSCOCO Training')
-    parser.add_argument('--dataname', help='dataname', default='coco14', choices=['coco14'])
+    parser.add_argument('--dataname', help='dataname', default='coco14', choices=['charades'])
     parser.add_argument('--dataset_dir', help='dir of dataset', default='/comp_robot/liushilong/data/COCO14/')
-    parser.add_argument('--img_size', default=448, type=int,
+    parser.add_argument('--img_size', default=224, type=int,
                         help='size of input images')
 
     parser.add_argument('--output', metavar='DIR', 
@@ -174,7 +171,7 @@ best_mAP = 0
 
 def main():
     args = get_args()
-    # os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+    
     if 'WORLD_SIZE' in os.environ:
         assert args.world_size > 0, 'please set --world-size and --rank in the command line'
         # launch by torch.distributed.launch
@@ -187,7 +184,7 @@ def main():
         args.world_size = args.world_size * local_world_size
         args.rank = args.rank * local_world_size + args.local_rank
         print('world size: {}, world rank: {}, local rank: {}'.format(args.world_size, args.rank, args.local_rank))
-        # print('os.environ:', os.environ)
+        print('os.environ:', os.environ)
     else:
         # single process, useful for debugging
         #   python main.py ...
@@ -229,18 +226,14 @@ def main_worker(args, logger):
 
     # build model
     # model = build_q2l(args)
-    model = build_LRFormer(args)
-
-    # args.lr_mult = args.batch_size / 256
-    # param_dicts = model.get_config_optim(lr=args.lr_mult * args.lr, lrp=0.1)
-
+    model = build_LRFormer3D(args)
     model = model.cuda()
     # input = torch.rand(1, 3, 448, 448)
     # params_num, flops = profile(model, inputs=(input,))
     # params_num, flops = clever_format([params_num, flops], '%.3f')
     # logger.info('complexity  ==>  params: {}M, FLOPs: {}G '.format(params_num, flops))
     ema_m = ModelEma(model, args.ema_decay) # 0.9997
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], broadcast_buffers=False, find_unused_parameters=True)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], broadcast_buffers=False)
 
     # criterion
     criterion = AsymmetricLossOptimized(
@@ -250,16 +243,12 @@ def main_worker(args, logger):
         eps=args.eps,
     )
 
-    # criterion = nn.MultiLabelSoftMarginLoss()
-    # criterion = nn.BCEWithLogitsLoss()
     # optimizer
-    
+    args.lr_mult = args.batch_size / 256
     if args.optim == 'AdamW':
         param_dicts = [
             {"params": [p for n, p in model.module.named_parameters() if p.requires_grad]},
         ]
-        args.lr_mult = args.batch_size / 256
-        # param_dicts = model.get_config_optim(lr=args.lr_mult * args.lr, lrp=0.1)
         optimizer = getattr(torch.optim, args.optim)(
             param_dicts,
             args.lr_mult * args.lr,
@@ -436,7 +425,7 @@ def main_worker(args, logger):
 
             # early stop
             if args.early_stop:
-                if best_epoch >= 0 and epoch - max(best_epoch, best_regular_epoch) > 3:
+                if best_epoch >= 0 and epoch - max(best_epoch, best_regular_epoch) > 8:
                     if len(ema_mAP_list) > 1 and ema_mAP_list[-1] < best_ema_mAP:
                         logger.info("epoch - best_epoch = {}, stop!".format(epoch - best_epoch))
                         if dist.get_rank() == 0 and args.kill_stop:
@@ -483,31 +472,14 @@ def train(train_loader, model, ema_m, criterion, optimizer, scheduler, epoch, ar
     for i, (images, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
-        # bs = target.size(0)
-        # mask = torch.zeros([bs, 80, 80])
-        # for b in range(bs):
-        #     pos_ind = torch.nonzero(target[b]==1).squeeze(1)
-            # neg_ind = torch.nonzero(target[b]==1).squeeze(1)
-            # mask[b].index_fill_(0, pos_ind, 1)
-            # mask[b].index_fill_(1, pos_ind, 1)
-            # mask[b].index_fill_(0, neg_ind, 0)
-            # mask[b].index_fill_(1, neg_ind, 0)
 
         images = images.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
-        # mask = mask.cuda(non_blocking=True)
-        # mask = None
+
         # compute output
         with torch.cuda.amp.autocast(enabled=args.amp):
             output = model(images)
-            # score1, score2 = model(images)
-            # cls_score = (score1 + score2) / 2.
-            # loss1 = criterion(score1, target)
-            # loss2 = criterion(score2, target)
             loss = criterion(output, target)
-            # loss = loss / images.size(0)
-            # loss = loss / target.size(1) * 1000
-
             if args.loss_dev > 0:
                 loss *= args.loss_dev
 
@@ -520,7 +492,7 @@ def train(train_loader, model, ema_m, criterion, optimizer, scheduler, epoch, ar
         scaler.scale(loss).backward()
         # for name, param in model.named_parameters():
         #     if param.grad is None:
-        #             print(name)
+        #         print(name)
         scaler.step(optimizer)
         scaler.update()
 
@@ -548,8 +520,6 @@ def train(train_loader, model, ema_m, criterion, optimizer, scheduler, epoch, ar
 def validate(val_loader, model, criterion, args, logger):
     batch_time = AverageMeter('Time', ':5.3f')
     losses = AverageMeter('Loss', ':5.3f')
-    # losses1 = AverageMeter('Loss1', ':5.3f')
-    # losses2 = AverageMeter('Loss2', ':5.3f')
     # Acc1 = AverageMeter('Acc@1', ':5.2f')
     # top5 = AverageMeter('Acc@5', ':5.2f')
     mem = AverageMeter('Mem', ':.0f', val_only=True)
@@ -562,8 +532,6 @@ def validate(val_loader, model, criterion, args, logger):
 
     # switch to evaluate mode
     saveflag = False
-    preds = None
-    targets = None
     model.eval()
     saved_data = []
     with torch.no_grad():
@@ -575,16 +543,7 @@ def validate(val_loader, model, criterion, args, logger):
             # compute output
             with torch.cuda.amp.autocast(enabled=args.amp):
                 output = model(images)
-                # score1, score2 = model(images)
-                # output = score2
-                # cls_score = (score1 + score2) / 2.
-                # loss1 = criterion(score1, target)
-                # loss2 = criterion(score2, target)
-                # loss = loss1 + loss2
                 loss = criterion(output, target)
-                # loss = loss / images.size(0)
-                # loss = loss / target.size(1) * 1000
-
                 if args.loss_dev > 0:
                     loss *= args.loss_dev
                 output_sm = torch.sigmoid(output)
@@ -594,9 +553,6 @@ def validate(val_loader, model, criterion, args, logger):
             # record loss
             losses.update(loss.item(), images.size(0))
             mem.update(torch.cuda.max_memory_allocated() / 1024.0 / 1024.0)
-            
-            preds = output.detach().cpu() if preds==None else torch.cat([output.detach().cpu(), preds], dim=0)
-            targets = target.detach().cpu() if targets==None else torch.cat([target.detach().cpu(), targets], dim=0)
 
             # save some data
             # output_sm = nn.functional.sigmoid(output)
@@ -632,15 +588,10 @@ def validate(val_loader, model, criterion, args, logger):
             print("Calculating mAP:")
             filenamelist = ['saved_data_tmp.{}.txt'.format(ii) for ii in range(dist.get_world_size())]
             metric_func = voc_mAP                
-            mAP, aps, = metric_func([os.path.join(args.output, _filename) for _filename in filenamelist], args.num_class, return_each=True)
-            OP, OR, OF1, CP, CR, CF1, = overall(preds, targets)
-            OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k = overall_topk(preds, targets, 3)
+            mAP, aps = metric_func([os.path.join(args.output, _filename) for _filename in filenamelist], args.num_class, return_each=True)
+            
             logger.info("  mAP: {}".format(mAP))
             logger.info("   aps: {}".format(np.array2string(aps, precision=5)))
-            logger.info('CP: {CP:.3f},  CR: {CR:.3f},  CF1: {CF1:.3f},  OP: {OP:.3f},  OR: {OR:.3f},  OF1: {OF1:.3f}'.format(
-                    OP=OP, OR=OR, OF1=OF1, CP=CP, CR=CR, CF1=CF1))
-            logger.info('CP_3: {CP:.3f},  CR_3: {CR:.3f},  CF1_3: {CF1:.3f},  OP_3: {OP:.3f},  OR_3: {OR:.3f},  OF1_3: {OF1:.3f}'.format(
-                    OP=OP_k, OR=OR_k, OF1=OF1_k, CP=CP_k, CR=CR_k, CF1=CF1_k))
         else:
             mAP = 0
 

@@ -1,5 +1,7 @@
+import imp
 import torchvision.transforms as transforms
 from dataset.cocodataset import CoCoDataset
+from dataset.charades_dataset import Charades
 from utils.cutout import SLCutoutPIL
 from randaugment import RandAugment
 import os.path as osp
@@ -47,7 +49,33 @@ def get_datasets(args):
             anno_path=osp.join(dataset_dir, 'annotations/instances_val2014.json'),
             input_transform=test_data_transform,
             labels_path='data/coco/val_label_vectors_coco14.npy',
-        )    
+        )
+    elif args.dataname == 'charades':
+        dataset_dir = args.dataset_dir
+        train_dataset = Charades(
+            mode='train',
+            data_dir=dataset_dir,
+            num_ensemble_views=1,
+            num_spatial_crops=1,
+            data_prefix='data/Charades/Charades_rgb',
+            num_frames=32,
+            sample_rate=2,
+            train_jitter_scales=[256, 340],
+            crop_size=224,
+            num_classes=157
+        )
+        val_dataset = Charades(
+            mode='val',
+            data_dir=dataset_dir,
+            num_ensemble_views=1,
+            num_spatial_crops=1,
+            data_prefix='data/Charades/Charades_rgb',
+            num_frames=32,
+            sample_rate=2,
+            train_jitter_scales=[256, 340],
+            crop_size=256,
+            num_classes=157
+        )
 
     else:
         raise NotImplementedError("Unknown dataname %s" % args.dataname)

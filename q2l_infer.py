@@ -17,16 +17,16 @@ import torch.utils.data
 import torch.utils.data.distributed
 
 import _init_paths
-from dataset.get_dataset import get_datasets
+from lib.dataset.get_dataset import get_datasets
 
 
-from utils.logger import setup_logger
-import models
-import models.aslloss
-from models.query2label import build_q2l
-from utils.metric import voc_mAP
-from utils.misc import clean_state_dict
-from utils.slconfig import get_raw_dict
+from lib.utils.logger import setup_logger
+import lib.models
+from lib.models.aslloss import AsymmetricLossOptimized
+from lib.models.query2label import build_q2l, build_LRFormer
+from lib.utils.metric import voc_mAP, overall, overall_topk
+from lib.utils.misc import clean_state_dict
+from lib.utils.slconfig import get_raw_dict
 
 
 def parser_args():
@@ -185,10 +185,11 @@ def main_worker(args, logger):
     global best_mAP
 
     # build model
-    model = build_q2l(args)
+    # model = build_q2l(args)
+    model = build_LRFormer(args)
     model = model.cuda()
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], broadcast_buffers=False)
-    criterion = models.aslloss.AsymmetricLossOptimized(
+    criterion = AsymmetricLossOptimized(
         gamma_neg=args.gamma_neg, gamma_pos=args.gamma_pos,
         disable_torch_grad_focal_loss=True,
         eps=args.eps,
@@ -230,12 +231,15 @@ def validate(val_loader, model, criterion, args, logger):
     batch_time = AverageMeter('Time', ':5.3f')
     losses = AverageMeter('Loss', ':5.3f')
     mem = AverageMeter('Mem', ':.0f', val_only=True)
+    # preds = AverageMeter('preds', ':5.3f')
+    # targets = AverageMeter('targets', ':5.3f')
 
     progress = ProgressMeter(
         len(val_loader),
         [batch_time, losses, mem],
         prefix='Test: ')
-
+    preds = None
+    targets = None
     # switch to evaluate mode
     model.eval()
     saved_data = []
@@ -249,12 +253,13 @@ def validate(val_loader, model, criterion, args, logger):
             with torch.cuda.amp.autocast(enabled=args.amp):
                 output = model(images)
                 loss = criterion(output, target)
-                output_sm = nn.functional.sigmoid(output)
+                output_sm = torch.sigmoid(output)
 
             # record loss
             losses.update(loss.item(), images.size(0))
             mem.update(torch.cuda.max_memory_allocated() / 1024.0 / 1024.0)
-
+            preds = output.detach().cpu() if preds==None else torch.cat([output.detach().cpu(), preds], dim=0)
+            targets = target.detach().cpu() if targets==None else torch.cat([target.detach().cpu(), targets], dim=0)
             # save some data
             _item = torch.cat((output_sm.detach().cpu(), target.detach().cpu()), 1)
             saved_data.append(_item)
@@ -285,10 +290,15 @@ def validate(val_loader, model, criterion, args, logger):
             print("Calculating mAP:")
             filenamelist = ['saved_data_tmp.{}.txt'.format(ii) for ii in range(dist.get_world_size())]
             metric_func = voc_mAP                
-            mAP, aps = metric_func([os.path.join(args.output, _filename) for _filename in filenamelist], args.num_class, return_each=True)
-            
+            mAP, aps, = metric_func([os.path.join(args.output, _filename) for _filename in filenamelist], args.num_class, return_each=True)
+            OP, OR, OF1, CP, CR, CF1, = overall(preds, targets)
+            OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k = overall_topk(preds, targets, 3)
             logger.info("  mAP: {}".format(mAP))
             logger.info("   aps: {}".format(np.array2string(aps, precision=5)))
+            logger.info('OP: {OP:.3f},  OR: {OR:.3f},  OF1: {OF1:.3f},  CP: {CP:.3f},  CR: {CR:.3f},  CF1: {CF1:.3f}'.format(
+                    OP=OP, OR=OR, OF1=OF1, CP=CP, CR=CR, CF1=CF1))
+            logger.info('OP_3: {OP:.3f},  OR_3: {OR:.3f},  OF1_3: {OF1:.3f},  CP_3: {CP:.3f},  CR_3: {CR:.3f},  CF1_3: {CF1:.3f}'.format(
+                    OP=OP_k, OR=OR_k, OF1=OF1_k, CP=CP_k, CR=CR_k, CF1=CF1_k))
         else:
             mAP = 0
 

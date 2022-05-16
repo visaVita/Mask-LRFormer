@@ -3,6 +3,7 @@
 We borrow the positional encoding from Detr and adding some other backbones.
 """
 from collections import OrderedDict
+import imp
 import os
 import warnings
 
@@ -17,6 +18,7 @@ from typing import Dict, List
 import models
 from models.cls_cvt import build_CvT
 from models.swin_transformer import build_swin_transformer
+from models.swintransformer3D import build_swin_transformer3D
 
 from utils.misc import clean_state_dict
 
@@ -28,13 +30,15 @@ def get_model_path(modelname):
         Config your pretrained model path here!
     """
     # raise NotImplementedError("Please config your pretrained modelpath!")
-    pretrained_dir = '/config/to/your/pretrained/model/dir/if/needed'
+    pretrained_dir = 'pretrained'
     PTDICT = {
         'CvT_w24': 'CvT-w24-384x384-IN-22k.pth',
-        'swin_L_384_22k': 'swin_large_patch4_window12_384_22k.pth',
+        'swin_L_384_22k': 'swin_large_patch4_window12_384_22k.pth', 
+        'swin_B_384_22k': 'swin_base_patch4_window12_384_22k.pth',
         'tresnetl': 'tresnet_l_448.pth',
         'tresnetxl': 'tresnet_xl_448.pth',
         'tresnetl_v2': 'tresnet_l_v2_miil_21k.pth',
+        'swin3D_B_224_22k': 'swin3D_B_224_charades_4881_32f.pth'
     }
     return os.path.join(pretrained_dir, PTDICT[modelname]) 
 
@@ -208,6 +212,16 @@ def build_backbone(args):
         backbone.forward = backbone.forward_features
         backbone.cls_token = False
         del backbone.head
+    elif args.backbone in ['swin3D_B_224_22k', 'swin3D_T_224_1k']:
+        backbone = build_swin_transformer3D(args.backbone)
+        if args.pretrained:
+            pretrainedpath = get_model_path(args.backbone)
+            checkpoint = torch.load(pretrainedpath, map_location='cpu')['model']
+            from collections import OrderedDict
+            _tmp_st = OrderedDict({k:v for k, v in clean_state_dict(checkpoint).items() if 'head' not in k})
+            _tmp_st_output = backbone.load_state_dict(_tmp_st, strict=False)
+            print(str(_tmp_st_output))
+        bb_num_channels = backbone.embed_dim * 8
     else:
         return_interm_layers = False
         backbone = Backbone(args.backbone, train_backbone, return_interm_layers, False, args.pretrained)
